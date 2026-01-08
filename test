@@ -1,38 +1,235 @@
-describe('GitLab Authentication Tests', () => {
+describe('Longhorn Storage Tests', () => {
 
-    it('should login successfully as root and verify via API', () => {
-        const creds = Cypress.env('gitlab');
-        const bootstrap = Cypress.env('bootstrap');
-
-        cy.loginToGitlab(creds.root_user, creds.root_password);
-
-        // API verification is session-based. The request will use cookies from loginToGitlab.
-        cy.request(`${bootstrap.gitlab.url}/api/v4/user`).then((response) => {
-            expect(response.status).to.eq(200);
-            cy.log(`API response username: ${response.body.username}`);
-            expect(response.body.username.toLowerCase()).to.eq(creds.root_user.toLowerCase());
-        });
-
-        cy.logoutFromGitlab();
+    beforeEach(() => {
+        cy.loginToLonghorn();
     });
 
-    it('should login successfully as normal user and verify via API', () => {
-        const creds = Cypress.env('gitlab');
+    // 1. Node Health Check
+    it('should verify all nodes are schedulable and ready', () => {
         const bootstrap = Cypress.env('bootstrap');
+        cy.getLonghornNodes().then((resp) => {
+            cy.log('Longhorn Nodes Status:', resp.status);
 
-        if (creds.normal_user) {
-            cy.loginToGitlab(creds.normal_user, creds.normal_password);
+            if (resp.status !== 200) {
+                cy.log('Error Response:', JSON.stringify(resp.body));
+            }
 
-            cy.request(`${bootstrap.gitlab.url}/api/v4/user`).then((response) => {
-                expect(response.status).to.eq(200);
-                cy.log(`API response username: ${response.body.username}`);
-                // Use toLowerCase() to be version/config agnostic on matching
-                expect(response.body.username.toLowerCase()).to.eq(creds.normal_user.toLowerCase());
+            expect(resp.status).to.eq(200);
+
+            // Handle different API structures (some versions might not nest in .data)
+            const nodes = resp.body.data || resp.body;
+            expect(nodes, 'Nodes data should exist').to.not.be.undefined;
+
+            const nodeArray = Array.isArray(nodes) ? nodes : [nodes];
+            expect(nodeArray.length).to.be.greaterThan(0);
+
+            nodeArray.forEach((node) => {
+                cy.log(`Checking Node: ${node.name || node.id}`);
+
+                // Flexible scheduling check
+                if (node.allowScheduling !== undefined) {
+                    expect(node.allowScheduling, `Node ${node.name} should allow scheduling`).to.be.true;
+                }
+
+                // Check Ready/Schedulable conditions if they exist
+                if (node.conditions) {
+                    Object.keys(node.conditions).forEach(key => {
+                        const condition = node.conditions[key];
+                        if (['Ready', 'Schedulable'].includes(key)) {
+                            expect(condition.status, `Node ${node.name} ${key} status`).to.eq('True');
+                        }
+                    });
+                }
             });
+        });
+    });
 
-            cy.logoutFromGitlab();
-        } else {
-            cy.log('Normal user not defined in env, skipping');
+    // 2. Volume Health Check
+    it('should verify all existing volumes are healthy', () => {
+        const bootstrap = Cypress.env('bootstrap');
+        cy.getLonghornVolumes().then((resp) => {
+            expect(resp.status).to.eq(200);
+            const volumes = resp.body.data || resp.body;
+
+            if (Array.isArray(volumes) && volumes.length > 0) {
+                volumes.forEach((vol) => {
+                    cy.log(`Checking Volume: ${vol.name} (State: ${vol.state})`);
+
+                    // Don't fail the whole suite for one degraded volume, but warn
+                    if (vol.robustness === 'faulted') {
+                        throw new Error(`Volume ${vol.name} is in FAULTED state!`);
+                    }
+                });
+            } else {
+                cy.log('No existing volumes found to check health.');
+            }
+        });
+    });
+
+    // 3. Lifecycle Test
+    it('should create and delete a test volume', () => {
+        const bootstrap = Cypress.env('bootstrap');
+        const creds = Cypress.env('longhorn');
+        const testVolumeName = `test-vol-${Date.now()}`;
+
+        // Create Volume (Using 1 replica for better compatibility in test envs)
+        cy.createLonghornVolume(testVolumeName, '1Gi', 1).then((resp) => {
+            cy.log('Create Volume Response Status:', resp.status);
+            cy.log('Create Volume Response Body:', JSON.stringify(resp.body));
+
+            if (resp.status !== 200 && resp.status !== 201) {
+                cy.log('Failed to create volume:', JSON.stringify(resp.body));
+            }
+            expect([200, 201]).to.include(resp.status);
+            cy.log(`Volume ${testVolumeName} creation requested.`);
+        });
+
+        // Verify Volume creation (poll until it appears)
+        const checkVolumeExists = (attempts = 0) => {
+            if (attempts > 12) throw new Error(`Volume ${testVolumeName} never appeared in list.`);
+
+            cy.getLonghornVolumes().then((resp) => {
+                const volumes = resp.body.data || resp.body;
+                if (!Array.isArray(volumes)) {
+                    cy.log('Unexpected volumes response format');
+                    return;
+                }
+
+                const found = volumes.some(vol => vol.name === testVolumeName);
+                if (found) {
+                    cy.log(`Confirmed: Volume ${testVolumeName} exists.`);
+                } else {
+                    cy.log(`Volume ${testVolumeName} not found yet (Attempt ${attempts + 1}/12)...`);
+                    cy.wait(4000);
+                    checkVolumeExists(attempts + 1);
+                }
+            });
+        };
+        checkVolumeExists();
+
+        // Delete Volume
+        cy.deleteLonghornVolume(testVolumeName).then((resp) => {
+            cy.log('Delete Volume Response Status:', resp.status);
+            expect([200, 204]).to.include(resp.status);
+        });
+
+        // Verify Deletion (poll until it's gone)
+        const checkVolumeDeleted = (attempts = 0) => {
+            if (attempts > 15) throw new Error(`Volume ${testVolumeName} still exists after deletion.`);
+
+            cy.getLonghornVolumes().then((resp) => {
+                const volumes = resp.body.data || resp.body;
+                const found = Array.isArray(volumes) && volumes.some(vol => vol.name === testVolumeName);
+                if (!found) {
+                    cy.log(`Confirmed: Volume ${testVolumeName} successfully deleted.`);
+                } else {
+                    cy.wait(4000);
+                    checkVolumeDeleted(attempts + 1);
+                }
+            });
+        };
+        checkVolumeDeleted();
+    });
+});
+
+
+---->>> longhorn command.js
+
+Cypress.Commands.add('loginToLonghorn', () => {
+    const bootstrap = Cypress.env('bootstrap');
+    const creds = Cypress.env('longhorn');
+
+    // 1. Visit with Basic Auth headers (handles browser popups)
+    cy.visit(bootstrap.longhorn.url, {
+        auth: {
+            username: creds.username,
+            password: creds.password
+        },
+        failOnStatusCode: false
+    });
+
+    // 2. Fallback: If there is a UI Form (some versions/proxies use a form instead of basic auth)
+    cy.get('body').then(($body) => {
+        if ($body.find('input[type="password"]').length > 0 || $body.find('#password').length > 0) {
+            cy.log('Detected Longhorn Login Form, attempting UI login...');
+
+            // Try common selectors for login forms
+            const userSelector = $body.find('input[type="text"]').length > 0 ? 'input[type="text"]' : '#username';
+            const passSelector = $body.find('input[type="password"]').length > 0 ? 'input[type="password"]' : '#password';
+
+            cy.get(userSelector).first().type(creds.username);
+            cy.get(passSelector).first().type(creds.password);
+            cy.get('button[type="submit"], button').contains(/login|sign in/i).click();
         }
+    });
+
+    // Verify we are in
+    cy.url().should('include', bootstrap.longhorn.url);
+});
+
+Cypress.Commands.add('getLonghornNodes', () => {
+    const bootstrap = Cypress.env('bootstrap');
+    const creds = Cypress.env('longhorn');
+    return cy.request({
+        method: 'GET',
+        url: `${bootstrap.longhorn.url}/v1/nodes`,
+        auth: {
+            user: creds.username,
+            pass: creds.password
+        },
+        // Don't follow redirects to login pages (which might return 200 OK HTML)
+        followRedirect: false,
+        failOnStatusCode: false
+    });
+});
+
+Cypress.Commands.add('getLonghornVolumes', () => {
+    const bootstrap = Cypress.env('bootstrap');
+    const creds = Cypress.env('longhorn');
+    return cy.request({
+        method: 'GET',
+        url: `${bootstrap.longhorn.url}/v1/volumes`,
+        auth: {
+            user: creds.username,
+            pass: creds.password
+        },
+        followRedirect: false,
+        failOnStatusCode: false
+    });
+});
+
+Cypress.Commands.add('createLonghornVolume', (volumeName, size = '1Gi', replicas = 1) => {
+    const bootstrap = Cypress.env('bootstrap');
+    const creds = Cypress.env('longhorn');
+    return cy.request({
+        method: 'POST',
+        url: `${bootstrap.longhorn.url}/v1/volumes`,
+        auth: {
+            user: creds.username,
+            pass: creds.password
+        },
+        body: {
+            name: volumeName,
+            size: size,
+            numberOfReplicas: replicas,
+            frontend: "blockdev"
+        },
+        followRedirect: false,
+        failOnStatusCode: false
+    });
+});
+
+Cypress.Commands.add('deleteLonghornVolume', (volumeName) => {
+    const bootstrap = Cypress.env('bootstrap');
+    const creds = Cypress.env('longhorn');
+    return cy.request({
+        method: 'DELETE',
+        url: `${bootstrap.longhorn.url}/v1/volumes/${volumeName}`,
+        auth: {
+            user: creds.username,
+            pass: creds.password
+        },
+        followRedirect: false,
+        failOnStatusCode: false
     });
 });
