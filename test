@@ -18,24 +18,32 @@ describe('GitLab Project Lifecycle Tests', () => {
         // 3. Delete Project
         cy.deleteProject(projectName, creds.root_user);
 
-        // 4. Verify deletion (polling because GitLab deletion is async/status 202)
+        // 4. Verify deletion (API-based check is best for EE v18.5 to avoid Activity feed noise)
         const bootstrap = Cypress.env('bootstrap');
+        const projectPath = encodeURIComponent(`${creds.root_user}/${projectName}`);
+        const apiUrl = `${bootstrap.gitlab.url}/api/v4/projects/${projectPath}`;
 
         const verifyDeletion = (attempts = 0) => {
-            if (attempts > 10) {
-                throw new Error(`Project ${projectName} failed to delete within the timeout.`);
+            if (attempts > 12) {
+                throw new Error(`Project ${projectName} still exists via API after timeout.`);
             }
 
-            cy.visit(bootstrap.gitlab.url);
-            cy.wait(2000); // Give GitLab a second to update the index
-
-            cy.get('body').then(($body) => {
-                if ($body.text().includes(projectName)) {
-                    cy.log(`Project still visible, retrying deletion check (${attempts + 1}/10)...`);
-                    cy.wait(3000);
+            // We use cy.request to check if the project actually exists in the DB
+            cy.request({
+                method: 'GET',
+                url: apiUrl,
+                failOnStatusCode: false
+            }).then((response) => {
+                if (response.status === 200) {
+                    cy.log(`Project still exists in API (Attempt ${attempts + 1}/12). waiting...`);
+                    cy.wait(5000);
                     verifyDeletion(attempts + 1);
+                } else if (response.status === 404) {
+                    cy.log('Confirmed: Project is gone (404 Not Found from API).');
                 } else {
-                    cy.log('Project successfully deleted.');
+                    cy.log(`Unexpected status: ${response.status}. Retrying...`);
+                    cy.wait(5000);
+                    verifyDeletion(attempts + 1);
                 }
             });
         };
