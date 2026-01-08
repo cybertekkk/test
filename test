@@ -1,0 +1,129 @@
+---config.js
+const { defineConfig } = require("cypress");
+const fs = require('fs');
+const path = require('path');
+const generateBootstrap = require('./bootstrap.config');
+
+module.exports = defineConfig({
+    e2e: {
+        setupNodeEvents(on, config) {
+            /**
+             * NOTE: The "bad IPC message" browser launch fix was removed per user request.
+             * If you encounter browser crashes in Multipass/Linux, you may need to re-add it.
+             */
+
+            // 1. Load dynamic bootstrap config (Priority: CLI --env domain=... > cypress.env.json)
+            const domain = config.env.domain;
+
+            if (!domain) {
+                throw new Error("\n\n[Config Error]: 'domain' is missing. Please set it in 'cypress.env.json' or via '--env domain=your-domain'\n");
+            }
+
+            const bootstrap = generateBootstrap(domain);
+            config.env.bootstrap = bootstrap;
+
+            // 2. Set dynamic Base URL (Ensures the domain from cypress.env.json is actually used)
+            config.baseUrl = bootstrap.gitlab.url;
+
+            // 3. Handle environment variable overrides for nested credentials (e.g. CYPRESS_GITLAB_PASSWORD)
+            const apps = ['gitlab', 'keycloak', 'longhorn', 'grafana', 'mattermost', 'neuvector', 'minio', 'pgadmin'];
+
+            apps.forEach(app => {
+                // Initialize the app object if it doesn't exist
+                if (!config.env[app]) {
+                    config.env[app] = {};
+                }
+
+                // Map CYPRESS_APP_KEY variables to config.env.app.key
+                Object.keys(process.env).forEach(envVar => {
+                    const prefix = `CYPRESS_${app.toUpperCase()}_`;
+                    if (envVar.startsWith(prefix)) {
+                        const key = envVar.replace(prefix, '').toLowerCase();
+                        config.env[app][key] = process.env[envVar];
+                    }
+                });
+            });
+
+            return config;
+        },
+        // Base URL is dynamically set in setupNodeEvents
+        baseUrl: null,
+        supportFile: 'cypress/support/e2e.js',
+        screenshotOnRunFailure: true,
+        video: true,
+        // Production Grade Security & Reliability
+        chromeWebSecurity: true,
+        retries: {
+            runMode: 2,
+            openMode: 0
+        },
+        defaultCommandTimeout: 10000,
+        pageLoadTimeout: 60000,
+        numTestsKeptInMemory: 1,
+        experimentalMemoryManagement: true,
+    },
+});
+
+
+
+
+----bootstrap
+/**
+ * Generates dynamic configuration based on the provided domain.
+ * This replaces the old bootstrap.json and the recursive placeholder replacement logic.
+ */
+module.exports = (domain) => {
+    return {
+        domain,
+        gitlab: {
+            url: `https://gitlab.${domain}`,
+            api_url: `https://gitlab.${domain}/api/v4`
+        },
+        keycloak: {
+            url: `https://keycloak.${domain}`,
+            saml_realm: domain
+        },
+        longhorn: {
+            url: `https://longhorn.${domain}`
+        },
+        grafana: {
+            url: `https://grafana.${domain}`
+        },
+        kroki: {
+            url: `https://kroki.${domain}`
+        },
+        mattermost: {
+            url: `https://mattermost.${domain}`
+        },
+        neuvector: {
+            url: `https://neuvector.${domain}`
+        },
+        minio: {
+            url: `https://minio.${domain}`,
+            api_url: `https://minio-api.${domain}`
+        },
+        pgadmin: {
+            url: `https://pgadmin.${domain}`
+        }
+    };
+};
+
+
+--access
+describe('GitLab Access Tests', () => {
+    const bootstrap = Cypress.env('bootstrap');
+
+    it('should verify GitLab is accessible', () => {
+        cy.visit(bootstrap.gitlab.url);
+        cy.title().should('include', 'GitLab');
+    });
+
+    const pages = ['/explore', '/help'];
+    pages.forEach((page) => {
+        it(`should verify access to ${page}`, () => {
+            cy.visit(bootstrap.gitlab.url + page);
+            cy.get('body').should('be.visible');
+        });
+    });
+});
+test
